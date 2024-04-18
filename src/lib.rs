@@ -45,6 +45,21 @@ impl ConnectionState {
         }
     }
 
+    /// Upon transmitting or retransmitting a data packet, the sender snapshots the current delivery information in per-packet state
+    pub fn send_packet_2(&mut self, send_time: Instant, no_packets_in_flight: bool) -> PacketState {
+        if no_packets_in_flight {
+            self.first_sent_time = send_time;
+            self.delivered_time = send_time;
+        }
+        PacketState {
+            delivered: self.delivered,
+            delivered_time: self.delivered_time,
+            first_sent_time: self.first_sent_time,
+            is_app_limited: self.app_limited.is_some(),
+            sent_time: send_time,
+        }
+    }
+
     /// Trigger situations:
     /// - the sending application asks the transport layer to send more data
     ///   - upon each write from the application, before new application data is enqueued in the transport send buffer or transmitted
@@ -62,16 +77,32 @@ impl ConnectionState {
         let few_data_to_send =
             sender_state.write_seq - send_sequence_space.nxt < send_sequence_space.mss;
         // the amount of data considered in flight is less than the congestion window
-        let unfilled_cwnd = sender_state.pipe < send_sequence_space.wnd;
+        let cwnd_not_full = sender_state.pipe < send_sequence_space.wnd;
 
         if few_data_to_send
             && sender_state.not_transmitting_a_packet()
-            && unfilled_cwnd
+            && cwnd_not_full
             && sender_state.all_lost_packets_retransmitted()
         {
             let last_transmitted_packet_index = self.delivered + sender_state.pipe;
             self.app_limited = Some(last_transmitted_packet_index)
         }
+    }
+
+    /// Trigger situations:
+    /// - the sending application asks the transport layer to send more data
+    ///   - upon each write from the application, before new application data is enqueued in the transport send buffer or transmitted
+    /// - `ACK` received from the transport layer
+    ///   - at the beginning of `ACK` processing, before updating the estimated number of packets in flight, and before congestion control modifies the `cwnd` or pacing rate
+    /// - timer
+    ///   - at the beginning of connection timer processing, for all timers that might result in the transmission of one or more data segments
+    ///   - e.g.: RTO timers, TLP timers, RACK reordering timers, Zero Window Probe timers
+    pub fn detect_application_limited_phases_2(&mut self, params: DetectAppLimitedPhaseParams) {
+        if !params.in_app_limited_phase() {
+            return;
+        }
+        let last_transmitted_packet_index = self.delivered + params.pipe;
+        self.app_limited = Some(last_transmitted_packet_index)
     }
 
     /// Upon receiving `ACK`
@@ -179,12 +210,12 @@ pub struct ConnectionSenderState {
     pub pipe: u64,
 }
 impl ConnectionSenderState {
-    // All the packets considered lost have been retransmitted
+    /// All the packets considered lost have been retransmitted
     fn all_lost_packets_retransmitted(&self) -> bool {
         self.lost_out <= self.retrans_out
     }
 
-    // The sending flow is not currently in the process of transmitting a packet
+    /// The sending flow is not currently in the process of transmitting a packet
     fn not_transmitting_a_packet(&self) -> bool {
         self.pending_transmissions == 0
     }
@@ -301,6 +332,30 @@ impl RateSample {
     /// `ACK` time interval calculated from the most recent packet delivered
     pub fn ack_elapsed(&self) -> Duration {
         self.ack_elapsed
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DetectAppLimitedPhaseParams {
+    /// The transport send buffer has less than `SMSS` of unsent data available to send
+    pub few_data_to_send: bool,
+    /// The sending flow is not currently in the process of transmitting a packet
+    pub not_transmitting_a_packet: bool,
+    /// The amount of data considered in flight is less than the congestion window
+    pub cwnd_not_full: bool,
+    /// All the packets considered lost have been retransmitted
+    pub all_lost_packets_retransmitted: bool,
+    /// The sender's estimate of the amount of data outstanding in the network (measured in octets or packets).
+    /// - This includes data packets in the current outstanding window that are being transmitted or retransmitted and have not been SACKed or marked lost (e.g. "pipe" from [RFC6675]).
+    /// - This does not include pure ACK packets.
+    pub pipe: u64,
+}
+impl DetectAppLimitedPhaseParams {
+    fn in_app_limited_phase(&self) -> bool {
+        self.few_data_to_send
+            && self.not_transmitting_a_packet
+            && self.cwnd_not_full
+            && self.all_lost_packets_retransmitted
     }
 }
 
