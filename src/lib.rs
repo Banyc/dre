@@ -79,13 +79,16 @@ impl ConnectionState {
         // the amount of data considered in flight is less than the congestion window
         let cwnd_not_full = sender_state.pipe < send_sequence_space.wnd;
 
-        if few_data_to_send
-            && sender_state.not_transmitting_a_packet()
-            && cwnd_not_full
-            && sender_state.all_lost_packets_retransmitted()
-        {
-            let last_transmitted_packet_index = self.delivered + sender_state.pipe;
-            self.app_limited = Some(last_transmitted_packet_index)
+        let params = DetectAppLimitedPhaseParams {
+            few_data_to_send,
+            not_transmitting_a_packet: sender_state.not_transmitting_a_packet(),
+            cwnd_not_full,
+            all_lost_packets_retransmitted: sender_state.all_lost_packets_retransmitted(),
+            pipe: sender_state.pipe,
+        };
+
+        if params.in_app_limited_phase() {
+            self.set_application_limited_phases(sender_state.pipe);
         }
     }
 
@@ -101,8 +104,17 @@ impl ConnectionState {
         if !params.in_app_limited_phase() {
             return;
         }
-        let last_transmitted_packet_index = self.delivered + params.pipe;
-        self.app_limited = Some(last_transmitted_packet_index)
+        self.set_application_limited_phases(params.pipe);
+    }
+
+    /// Trigger situations: [`Self::detect_application_limited_phases()`].
+    ///
+    /// `pipe`: The sender's estimate of the amount of data outstanding in the network (measured in octets or packets).
+    /// - This includes data packets in the current outstanding window that are being transmitted or retransmitted and have not been SACKed or marked lost (e.g. "pipe" from [RFC6675]).
+    /// - This does not include pure ACK packets.
+    pub fn set_application_limited_phases(&mut self, pipe: u64) {
+        let last_transmitted_packet_index = self.delivered + pipe;
+        self.app_limited = Some(last_transmitted_packet_index);
     }
 
     /// Upon receiving `ACK`
